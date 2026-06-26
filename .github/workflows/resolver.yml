@@ -1,0 +1,146 @@
+name: Run Resolver
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Embed / player URL to resolve"
+        required: false
+        default: "https://www.2embed.stream/embed/movie/tt0373074"
+      browser:
+        description: "Use Playwright browser observer fallback"
+        type: boolean
+        required: false
+        default: false
+      redact:
+        description: "Redact sensitive tokens / cookies in output"
+        type: boolean
+        required: false
+        default: false
+      serve:
+        description: "Start the /resolve HTTP server (runs for 60 s then stops)"
+        type: boolean
+        required: false
+        default: false
+      serve_port:
+        description: "Port for the HTTP server (only used when serve = true)"
+        required: false
+        default: "8088"
+
+jobs:
+  resolve:
+    name: Resolve embed URL
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python ──────────────────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ── 3. Playwright (only when browser = true) ───────────────────────────
+      - name: Install Playwright + Chromium
+        if: ${{ inputs.browser == true }}
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      # ── 4. Build CLI flags ─────────────────────────────────────────────────
+      - name: Build flags
+        id: flags
+        run: |
+          FLAGS=""
+          if [ "${{ inputs.browser }}" = "true" ]; then FLAGS="$FLAGS --browser"; fi
+          if [ "${{ inputs.redact }}" = "true" ]; then FLAGS="$FLAGS --redact"; fi
+          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
+
+      # ── 5a. Run resolver (non-server mode) ─────────────────────────────────
+      - name: Run resolver
+        if: ${{ inputs.serve != true }}
+        run: |
+          python resolver.py \
+            "${{ inputs.url }}" \
+            ${{ steps.flags.outputs.flags }} \
+            | tee result.json
+
+      # ── 5b. Run server mode (60-second smoke test) ─────────────────────────
+      - name: Start server and probe /resolve
+        if: ${{ inputs.serve == true }}
+        run: |
+          python resolver.py \
+            --serve \
+            --host 127.0.0.1 \
+            --port "${{ inputs.serve_port }}" \
+            ${{ steps.flags.outputs.flags }} &
+          SERVER_PID=$!
+
+          # Wait for the server to be ready (up to 15 s)
+          for i in $(seq 1 15); do
+            if curl -sf "http://127.0.0.1:${{ inputs.serve_port }}/" > /dev/null 2>&1; then
+              echo "Server is up."
+              break
+            fi
+            sleep 1
+          done
+
+          ENCODED_URL=$(python -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "${{ inputs.url }}")
+          REDACT_PARAM=""
+          if [ "${{ inputs.redact }}" = "true" ]; then REDACT_PARAM="&redact=1"; fi
+
+          curl -sf \
+            "http://127.0.0.1:${{ inputs.serve_port }}/resolve?url=${ENCODED_URL}${REDACT_PARAM}" \
+            | tee result.json
+
+          kill $SERVER_PID || true
+
+      # ── 6. Pretty-print summary ────────────────────────────────────────────
+      - name: Print summary
+        if: always()
+        run: |
+          echo "## Resolver result" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          python -m json.tool result.json 2>/dev/null \
+            || cat result.json \
+            || echo "(no result file)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          # Surface key fields directly in the log
+          python - <<'PY'
+          import json, sys
+          try:
+              data = json.load(open("result.json"))
+          except Exception as e:
+              print(f"Could not parse result.json: {e}")
+              sys.exit(0)
+          print(f"status       : {data.get('status')}")
+          print(f"original_url : {data.get('original_url')}")
+          print(f"resolved_url : {data.get('resolved_url')}")
+          media = data.get("media_urls", [])
+          print(f"media_urls   : {len(media)} found")
+          for u in media[:10]:
+              print(f"  {u}")
+          if len(media) > 10:
+              print(f"  … and {len(media) - 10} more")
+          iframes = data.get("iframe_urls", [])
+          print(f"iframe_urls  : {len(iframes)} found")
+          errors = data.get("errors", [])
+          if errors:
+              print(f"errors ({len(errors)}):")
+              for e in errors:
+                  print(f"  {e}")
+          PY
+
+      # ── 7. Upload result as artifact ───────────────────────────────────────
+      - name: Upload result JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolver-result
+          path: result.json
+          retention-days: 7
